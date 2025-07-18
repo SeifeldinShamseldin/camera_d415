@@ -553,3 +553,224 @@ class SurfaceNormalsDetector:
             
         except Exception:
             return None
+
+
+class CylindricalObjectDetector:
+    """
+    Specialized detector for cylindrical featureless objects like Template 2 (lighter)
+    Inspired by shared PreciseDetector's approach to featureless detection
+    """
+    
+    def __init__(self, params: DetectionParams):
+        self.params = params
+        
+    def detect(self, rgb: np.ndarray, depth: np.ndarray, template_data: Dict) -> Optional[Detection]:
+        """Detect cylindrical objects using shape + color + depth fusion"""
+        try:
+            start_time = time.time()
+            
+            # Multi-modal approach for featureless objects
+            detections = []
+            
+            # 1. Color-based detection (for green lighter)
+            color_detection = self._detect_by_color(rgb, template_data)
+            if color_detection:
+                detections.append(color_detection)
+            
+            # 2. Shape-based detection (cylindrical form)
+            shape_detection = self._detect_cylindrical_shape(rgb, template_data)
+            if shape_detection:
+                detections.append(shape_detection)
+                
+            # 3. Depth-based validation (cylinder geometry)
+            if depth is not None:
+                depth_detection = self._detect_by_depth_profile(depth, template_data)
+                if depth_detection:
+                    detections.append(depth_detection)
+            
+            # Fuse multiple detections if available
+            if len(detections) >= 2:
+                # Multiple methods detected - high confidence
+                best_detection = max(detections, key=lambda d: d['confidence'])
+                final_confidence = min(0.95, best_detection['confidence'] * 1.2)  # Boost confidence
+            elif len(detections) == 1:
+                best_detection = detections[0]
+                final_confidence = best_detection['confidence']
+            else:
+                return None
+            
+            processing_time = time.time() - start_time
+            
+            return Detection(
+                template_name=template_data['name'],
+                confidence=final_confidence,
+                corners=best_detection['corners'],
+                pose_6d={'success': False},
+                modality=ModalityType.CONTOUR_SHAPE,  # Using contour as primary modality
+                processing_time=processing_time
+            )
+            
+        except Exception as e:
+            print(f"Cylindrical object detection error: {e}")
+            return None
+    
+    def _detect_by_color(self, rgb: np.ndarray, template_data: Dict) -> Optional[Dict]:
+        """Detect objects by color similarity (for colored objects like green lighter)"""
+        try:
+            # Convert to HSV for better color matching
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV)
+            template_hsv = cv2.cvtColor(template_data['rgb'], cv2.COLOR_BGR2HSV)
+            
+            # Calculate dominant color in template
+            template_hist = cv2.calcHist([template_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+            
+            # Find regions with similar color
+            mask = self._create_color_mask(hsv, template_hsv)
+            
+            # Find contours in color mask
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 1000 or area > 20000:  # Filter by reasonable size
+                    continue
+                
+                # Get bounding rectangle
+                rect = cv2.boundingRect(contour)
+                x, y, w, h = rect
+                
+                # Check aspect ratio (cylindrical objects are often tall/thin)
+                aspect_ratio = h / w if w > 0 else 0
+                if 1.5 < aspect_ratio < 5.0:  # Reasonable range for cylinder
+                    corners = np.array([
+                        [x, y], [x+w, y], [x+w, y+h], [x, y+h]
+                    ], dtype=np.float32).reshape(-1, 1, 2)
+                    
+                    # Calculate color similarity confidence
+                    region = rgb[y:y+h, x:x+w]
+                    confidence = self._calculate_color_similarity(region, template_data['rgb'])
+                    
+                    if confidence > 0.6:
+                        return {
+                            'corners': corners,
+                            'confidence': confidence,
+                            'method': 'color'
+                        }
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    def _detect_cylindrical_shape(self, rgb: np.ndarray, template_data: Dict) -> Optional[Dict]:
+        """Detect cylindrical shapes using contour analysis"""
+        try:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+            
+            # Enhanced edge detection for smooth objects
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 30, 100)  # Lower thresholds for smooth objects
+            
+            # Morphological operations to connect broken edges
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+            
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            template_h, template_w = template_data['rgb'].shape[:2]
+            template_aspect = template_h / template_w
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 1000:
+                    continue
+                
+                # Fit ellipse to check for cylindrical shape
+                if len(contour) >= 5:
+                    ellipse = cv2.fitEllipse(contour)
+                    (center_x, center_y), (width, height), angle = ellipse
+                    
+                    ellipse_aspect = max(height, width) / min(height, width) if min(height, width) > 0 else 0
+                    
+                    # Check if aspect ratio matches template and is cylindrical
+                    aspect_match = min(ellipse_aspect / template_aspect, template_aspect / ellipse_aspect)
+                    
+                    if aspect_match > 0.7 and 1.5 < ellipse_aspect < 5.0:
+                        # Create corners from ellipse
+                        x, y, w, h = cv2.boundingRect(contour)
+                        corners = np.array([
+                            [x, y], [x+w, y], [x+w, y+h], [x, y+h]
+                        ], dtype=np.float32).reshape(-1, 1, 2)
+                        
+                        confidence = aspect_match * 0.8  # Shape-based confidence
+                        
+                        return {
+                            'corners': corners,
+                            'confidence': confidence,
+                            'method': 'shape'
+                        }
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    def _detect_by_depth_profile(self, depth: np.ndarray, template_data: Dict) -> Optional[Dict]:
+        """Detect cylindrical objects using depth profile analysis"""
+        try:
+            # This would analyze the cylindrical depth profile
+            # For now, return None - could be enhanced with actual depth analysis
+            return None
+            
+        except Exception:
+            return None
+    
+    def _create_color_mask(self, hsv: np.ndarray, template_hsv: np.ndarray) -> np.ndarray:
+        """Create mask for similar colors"""
+        try:
+            # Calculate mean HSV values from template
+            mean_h = np.mean(template_hsv[:,:,0])
+            mean_s = np.mean(template_hsv[:,:,1]) 
+            mean_v = np.mean(template_hsv[:,:,2])
+            
+            # Define range around template color
+            h_range = 20  # Hue tolerance
+            s_range = 60  # Saturation tolerance  
+            v_range = 60  # Value tolerance
+            
+            lower = np.array([max(0, mean_h - h_range), max(0, mean_s - s_range), max(0, mean_v - v_range)])
+            upper = np.array([min(179, mean_h + h_range), min(255, mean_s + s_range), min(255, mean_v + v_range)])
+            
+            mask = cv2.inRange(hsv, lower, upper)
+            
+            # Clean up mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            
+            return mask
+            
+        except Exception:
+            return np.zeros_like(hsv[:,:,0])
+    
+    def _calculate_color_similarity(self, region: np.ndarray, template: np.ndarray) -> float:
+        """Calculate color similarity between region and template"""
+        try:
+            # Resize to same size
+            region_resized = cv2.resize(region, (template.shape[1], template.shape[0]))
+            
+            # Convert to HSV
+            region_hsv = cv2.cvtColor(region_resized, cv2.COLOR_BGR2HSV)
+            template_hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+            
+            # Calculate histograms
+            region_hist = cv2.calcHist([region_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+            template_hist = cv2.calcHist([template_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+            
+            # Compare histograms
+            correlation = cv2.compareHist(region_hist, template_hist, cv2.HISTCMP_CORREL)
+            
+            return max(0.0, correlation)
+            
+        except Exception:
+            return 0.0

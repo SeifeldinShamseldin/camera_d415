@@ -10,6 +10,7 @@ import cv2
 import time
 from typing import List, Optional, Dict
 import concurrent.futures
+from collections import deque
 
 from ..config import SystemConfig, ModalityType
 from ..detection.engines import (
@@ -18,7 +19,8 @@ from ..detection.engines import (
 )
 from ..detection.featureless_engines import (
     ContourShapeDetector, DepthHistogramDetector,
-    GeometricPrimitivesDetector, SurfaceNormalsDetector
+    GeometricPrimitivesDetector, SurfaceNormalsDetector,
+    CylindricalObjectDetector
 )
 from ..core.template_manager import TemplateManager
 from ..utils.pose_estimation import PoseEstimator, PoseVisualizer, PoseFilter
@@ -78,8 +80,8 @@ class AdaptiveMultiModalDetector:
             'avg_time': 0
         }
         
-        # Detection stability tracking
-        self.detection_history = {}  # Track detections over time
+        # Enhanced detection stability tracking (inspired by shared PreciseDetector)
+        self.detection_history = deque(maxlen=5)  # 5-frame rolling history
         self.stable_detections = {}  # Currently stable detections
         self.last_detections = []    # Store last frame detections for smoothing
         
@@ -300,9 +302,12 @@ class AdaptiveMultiModalDetector:
         # Apply NMS (like original code)
         final_detections = self._apply_nms(all_detections)
         
+        # Apply enhanced temporal filtering for stability
+        stable_detections = self._apply_temporal_smoothing(final_detections)
+        
         # Enhance detections with pose estimation
         enhanced_detections = []
-        for detection in final_detections:
+        for detection in stable_detections:
             enhanced_detection = self._enhance_detection_with_pose(detection)
             enhanced_detections.append(enhanced_detection)
         
@@ -314,39 +319,45 @@ class AdaptiveMultiModalDetector:
         return enhanced_detections
     
     def _apply_temporal_smoothing(self, current_detections: List[Detection]) -> List[Detection]:
-        """Apply temporal smoothing to reduce detection flickering"""
-        # If no previous detections, just return current
-        if not self.last_detections:
+        """
+        Enhanced temporal filtering using 5-frame consistency
+        Inspired by shared PreciseDetector code
+        """
+        # Add current detections to history
+        self.detection_history.append(current_detections)
+        
+        # If not enough history, return current detections
+        if len(self.detection_history) < 3:
             self.last_detections = current_detections
             return current_detections
         
-        # Simple smoothing: if we had detections last frame and this frame, keep them
-        # This prevents flickering where objects appear/disappear rapidly
-        smoothed = []
+        # Only keep detections that appear consistently (like shared code)
+        stable_detections = []
         
-        # Add all current detections (they passed confidence threshold)
-        smoothed.extend(current_detections)
-        
-        # Also add previous detections that are close to current ones (prevents disappearing)
-        for prev_det in self.last_detections:
-            found_similar = False
-            for curr_det in current_detections:
-                if (prev_det.template_name == curr_det.template_name and
-                    self._detections_close(prev_det, curr_det)):
-                    found_similar = True
-                    break
+        for detection in current_detections:
+            # Count how many times this detection appears in recent history
+            consistent_count = 0
             
-            # If previous detection is close but not found, add it with reduced confidence
-            if not found_similar:
-                # Reduce confidence slightly and add
-                prev_det.confidence *= 0.9
-                if prev_det.confidence > 0.05:  # Still above minimum
-                    smoothed.append(prev_det)
+            for historical_detections in self.detection_history:
+                for hist_det in historical_detections:
+                    if hist_det.template_name == detection.template_name:
+                        # Check if positions are similar (same as shared code logic)
+                        curr_center = np.mean(detection.corners.reshape(-1, 2), axis=0)
+                        hist_center = np.mean(hist_det.corners.reshape(-1, 2), axis=0)
+                        distance = np.linalg.norm(curr_center - hist_center)
+                        
+                        if distance < 50:  # 50 pixels tolerance (same as shared code)
+                            consistent_count += 1
+                            break
+            
+            # Only keep if detection is consistent (appears in at least 2 of last 3 frames)
+            if consistent_count >= 2:  
+                stable_detections.append(detection)
         
         # Update last detections
         self.last_detections = current_detections
         
-        return smoothed
+        return stable_detections
     
     def _detections_close(self, det1: Detection, det2: Detection) -> bool:
         """Check if two detections are spatially close"""

@@ -111,13 +111,17 @@ class SIFTDetector:
             return None
 
 class TemplateDetector:
-    """Traditional template matching for featureless objects"""
+    """Enhanced template matching for featureless objects with strict validation"""
     
     def __init__(self, params: DetectionParams):
         self.params = params
+        # Add ValidationEngine for strict detection validation
+        self.validator = ValidationEngine(params)
+        # Extended scale range inspired by shared PreciseDetector
+        self.precise_scales = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3]
     
     def detect_rgb(self, rgb: np.ndarray, template_data: Dict) -> Optional[Detection]:
-        """RGB template matching"""
+        """Enhanced RGB template matching with strict validation"""
         try:
             start_time = time.time()
             
@@ -125,7 +129,8 @@ class TemplateDetector:
             gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
             template_gray = cv2.cvtColor(template_data['rgb'], cv2.COLOR_BGR2GRAY)
             
-            best_match = self._multi_scale_match(gray, template_gray, self.params.template_threshold)
+            # Use precise multi-scale matching with extended scales
+            best_match = self._precise_multi_scale_match(gray, template_gray, template_data, rgb)
             
             if best_match is None:
                 return None
@@ -217,6 +222,63 @@ class TemplateDetector:
                     }
         
         return best_match
+    
+    def _precise_multi_scale_match(self, gray: np.ndarray, template_gray: np.ndarray, 
+                                  template_data: Dict, rgb_frame: np.ndarray) -> Optional[Dict]:
+        """
+        Precise multi-scale template matching with strict validation
+        Inspired by shared PreciseDetector code
+        """
+        detections = []
+        
+        # Test multiple scales (like shared code)
+        for scale in self.precise_scales:
+            # Resize template
+            new_size = (int(template_gray.shape[1] * scale), 
+                       int(template_gray.shape[0] * scale))
+            
+            if new_size[0] <= 0 or new_size[1] <= 0:
+                continue
+                
+            scaled_template = cv2.resize(template_gray, new_size)
+            
+            if (scaled_template.shape[0] > gray.shape[0] or 
+                scaled_template.shape[1] > gray.shape[1]):
+                continue
+            
+            # Template matching with higher initial threshold
+            result = cv2.matchTemplate(gray, scaled_template, cv2.TM_CCOEFF_NORMED)
+            
+            # Find all matches above initial threshold
+            locations = np.where(result >= 0.6)  # Higher initial threshold
+            
+            for pt in zip(*locations[::-1]):
+                x, y = pt
+                h, w = scaled_template.shape
+                
+                corners = np.array([
+                    [x, y], [x + w, y], [x + w, y + h], [x, y + h]
+                ], dtype=np.float32).reshape(-1, 1, 2)
+                
+                # Apply strict validation (like shared code)
+                initial_confidence = result[y, x]
+                is_valid, final_confidence = self.validator.validate_detection(
+                    corners, template_data, rgb_frame, initial_confidence
+                )
+                
+                if is_valid:
+                    detections.append({
+                        'corners': corners,
+                        'confidence': final_confidence,
+                        'scale': scale
+                    })
+        
+        # Return best detection if any passed validation
+        if detections:
+            best_detection = max(detections, key=lambda d: d['confidence'])
+            return best_detection
+        
+        return None
 
 class DepthEdgeDetector:
     """Depth edge-based detection"""
@@ -428,3 +490,134 @@ class DetectionFusion:
             return max(fused_detections, key=lambda d: d.confidence)
         
         return None
+
+
+class ValidationEngine:
+    """
+    Strict validation engine inspired by PreciseDetector
+    Implements multi-layer validation to eliminate false positives
+    """
+    
+    def __init__(self, params: DetectionParams):
+        self.params = params
+        # Strict validation thresholds (inspired by shared code)
+        self.min_confidence = 0.75      # Much higher threshold
+        self.min_area = 2000           # Minimum detection area
+        self.max_area = 50000          # Maximum detection area
+        self.min_aspect_ratio = 0.3    # Minimum aspect ratio
+        self.max_aspect_ratio = 3.0    # Maximum aspect ratio
+        
+    def validate_detection(self, corners: np.ndarray, template_data: Dict, 
+                          frame: np.ndarray, initial_confidence: float) -> Tuple[bool, float]:
+        """
+        Strict validation to reduce false positives using multiple criteria
+        Returns (is_valid, final_confidence)
+        """
+        try:
+            # 1. Check area bounds
+            area = cv2.contourArea(corners.astype(np.int32))
+            if area < self.min_area or area > self.max_area:
+                return False, 0.0
+            
+            # 2. Check aspect ratio
+            x_coords = corners[:, 0] if len(corners.shape) == 2 else corners[:, 0, 0]
+            y_coords = corners[:, 1] if len(corners.shape) == 2 else corners[:, 0, 1]
+            
+            width = np.max(x_coords) - np.min(x_coords)
+            height = np.max(y_coords) - np.min(y_coords)
+            
+            if width <= 0 or height <= 0:
+                return False, 0.0
+            
+            aspect_ratio = width / height
+            if aspect_ratio < self.min_aspect_ratio or aspect_ratio > self.max_aspect_ratio:
+                return False, 0.0
+            
+            # 3. Check aspect ratio match with template
+            template_h, template_w = template_data['rgb'].shape[:2]
+            template_ratio = template_w / template_h
+            ratio_match = min(aspect_ratio / template_ratio, template_ratio / aspect_ratio)
+            
+            if ratio_match < 0.5:  # Strict aspect ratio matching
+                return False, 0.0
+            
+            # 4. Extract region and validate
+            x1, y1 = int(np.min(x_coords)), int(np.min(y_coords))
+            x2, y2 = int(np.max(x_coords)), int(np.max(y_coords))
+            
+            # Ensure bounds are valid
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+            
+            if x2 - x1 < 20 or y2 - y1 < 20:
+                return False, 0.0
+            
+            # 5. Histogram comparison
+            region = frame[y1:y2, x1:x2]
+            hist_correlation = self._compare_histograms(region, template_data['rgb'])
+            
+            if hist_correlation < 0.3:  # Strict histogram matching
+                return False, 0.0
+            
+            # 6. Template matching validation
+            gray_region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            template_gray = cv2.cvtColor(template_data['rgb'], cv2.COLOR_BGR2GRAY)
+            
+            # Resize template to match region size
+            resized_template = cv2.resize(template_gray, (gray_region.shape[1], gray_region.shape[0]))
+            
+            result = cv2.matchTemplate(gray_region, resized_template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            
+            if max_val < 0.6:  # Strict template matching
+                return False, 0.0
+            
+            # 7. Edge comparison (like shared code)
+            region_edges = cv2.Canny(gray_region, 50, 150)
+            template_edges = cv2.Canny(resized_template, 50, 150)
+            
+            region_edge_count = np.sum(region_edges > 0)
+            template_edge_count = np.sum(template_edges > 0)
+            
+            if template_edge_count > 0:
+                edge_ratio = region_edge_count / template_edge_count
+                if edge_ratio < 0.3 or edge_ratio > 3.0:
+                    return False, 0.0
+            
+            # Calculate final confidence (weighted combination)
+            final_confidence = (
+                ratio_match * 0.3 + 
+                hist_correlation * 0.4 + 
+                max_val * 0.3
+            )
+            
+            # Must exceed minimum confidence threshold
+            is_valid = final_confidence > self.min_confidence
+            
+            return is_valid, final_confidence
+            
+        except Exception as e:
+            print(f"Validation error: {e}")
+            return False, 0.0
+    
+    def _compare_histograms(self, region: np.ndarray, template: np.ndarray) -> float:
+        """Compare color histograms between region and template"""
+        try:
+            # Convert to same size for fair comparison
+            region_resized = cv2.resize(region, (template.shape[1], template.shape[0]))
+            
+            # Calculate histograms
+            region_hist = cv2.calcHist([region_resized], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256])
+            template_hist = cv2.calcHist([template], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256])
+            
+            # Normalize histograms
+            region_hist = cv2.normalize(region_hist, region_hist).flatten()
+            template_hist = cv2.normalize(template_hist, template_hist).flatten()
+            
+            # Compare using correlation
+            correlation = cv2.compareHist(region_hist, template_hist, cv2.HISTCMP_CORREL)
+            
+            return max(0.0, correlation)  # Ensure non-negative
+            
+        except Exception:
+            return 0.0
